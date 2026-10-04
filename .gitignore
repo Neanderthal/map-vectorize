@@ -1,0 +1,12 @@
+# Исходные растры + PDF легенд (тяжёлые, ~130 МБ) — тянутся src/fetch_sources.py
+data/raw/
+# Промежуточные привязанные растры
+data/work/
+output/*.tif
+output/*.tiff
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
