@@ -202,7 +202,7 @@ def build_gcps(top_c, bot_c, top_fit, bot_fit, lat_min, lat_max, lons):
                                            x=float(lon), y=float(lat)))
     return gcps
 
-def warp(raw_path, gcps, out_path, downscale=4, order=2, out_w=2600):
+def warp(raw_path, gcps, out_path, downscale=4, order=2, resampling=Resampling.bilinear):
     im = np.asarray(Image.open(raw_path).convert("RGB"))
     H, W = im.shape[:2]
     s = 1.0 / downscale
@@ -212,7 +212,7 @@ def warp(raw_path, gcps, out_path, downscale=4, order=2, out_w=2600):
     lats = [p.y for p in gcps]
     lon0, lon1 = min(lons) - 0.1, max(lons) + 0.1
     lat0, lat1 = min(lats) - 0.1, max(lats) + 0.1
-    wo = out_w
+    wo = small.shape[1]                      # выходное разрешение ~ исходному/downscale
     ho = int(wo * (lat1 - lat0) / (lon1 - lon0))
     transform = from_bounds(lon0, lat0, lon1, lat1, wo, ho)
     crs = "EPSG:4326"
@@ -220,14 +220,14 @@ def warp(raw_path, gcps, out_path, downscale=4, order=2, out_w=2600):
     src = np.transpose(small, (2, 0, 1)).copy()
     for b in range(3):
         reproject(src[b], dst[b], gcps=g, src_crs=crs, dst_transform=transform,
-                  dst_crs=crs, resampling=Resampling.bilinear, MAX_GCP_ORDER=order)
+                  dst_crs=crs, resampling=resampling, MAX_GCP_ORDER=order)
     with rasterio.open(out_path, "w", driver="GTiff", height=ho, width=wo, count=3,
                        dtype="uint8", crs=crs, transform=transform, compress="deflate") as d:
         d.write(dst)
     print(f"[warp] {out_path}  {wo}x{ho}  lon[{lon0:.2f},{lon1:.2f}] lat[{lat0:.2f},{lat1:.2f}]")
     return out_path
 
-def georef(key):
+def georef(key, downscale=4, resampling=Resampling.bilinear, out_suffix=""):
     cfg = SHEETS[key]
     nom = parse_sheet(cfg["sheet_id"])
     print(f"[A] {cfg['sheet_id']} -> lon {nom.lon_min}..{nom.lon_max}E lat {nom.lat_min}..{nom.lat_max}N "
@@ -249,7 +249,8 @@ def georef(key):
     print(f"[fuse] extent west={west:.2f} east={east:.2f} -> меридианы {lon_lo}..{lon_hi}E "
           f"(номенклатура {nom.lon_min}..{nom.lon_max})")
     gcps = build_gcps(top_c, bot_c, top_fit, bot_fit, nom.lat_min, nom.lat_max, lons)
-    out = warp(cfg["raw"], gcps, f"data/work/{key}_georef_4326.tif")
+    out = warp(cfg["raw"], gcps, f"data/work/{key}_georef_4326{out_suffix}.tif",
+               downscale=downscale, resampling=resampling)
     print(f"[gate] C-fit top/bot ok; nomenclature lat {nom.lat_min}-{nom.lat_max}; see lake validation")
     return out
 
