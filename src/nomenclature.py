@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 import re
+from collections import Counter
 from dataclasses import dataclass
 
 # Кириллические омоглифы -> латиница (буквы рядов IMW латинские A..V)
@@ -51,11 +52,9 @@ class SheetFrame:
         return list(range(self.lat_min, self.lat_max + 1))
 
     @property
-    def is_rectangular(self) -> bool:
-        """Union ячеек образует один прямоугольник (иначе — сложный составной лист)."""
-        cols = {c for _, c in self.cells}
-        rows = {r for r, _ in self.cells}
-        return len(self.cells) == len(cols) * len(rows)
+    def multi_row(self) -> bool:
+        """Несколько разных букв ряда в ID — повод для флага в ворота (широта по доминанте)."""
+        return len({r for r, _ in self.cells}) > 1
 
 
 def parse_sheet(sheet_id: str) -> SheetFrame:
@@ -84,10 +83,12 @@ def parse_sheet(sheet_id: str) -> SheetFrame:
     if not cells:
         raise ValueError(f"пустая номенклатура: {sheet_id!r}")
 
+    # долгота: по всем колоннам (может быть сдвоено); широта: 1:1М всегда один ряд (4°),
+    # поэтому берём доминирующую букву ряда — устойчиво к артефактам вроде лишнего 'N-35'
     lon0 = min(_col_band(c)[0] for _, c in cells)
     lon1 = max(_col_band(c)[1] for _, c in cells)
-    lat0 = min(_row_band(r)[0] for r, _ in cells)
-    lat1 = max(_row_band(r)[1] for r, _ in cells)
+    dom_row = Counter(r for r, _ in cells).most_common(1)[0][0]
+    lat0, lat1 = _row_band(dom_row)
     return SheetFrame(sheet_id, lon0, lon1, lat0, lat1, cells)
 
 
@@ -96,6 +97,6 @@ if __name__ == "__main__":
         try:
             f = parse_sheet(sid)
             print(f"{sid:18s} -> lon {f.lon_min}..{f.lon_max}E  lat {f.lat_min}..{f.lat_max}N  "
-                  f"cells={f.cells}  rect={f.is_rectangular}")
+                  f"cells={f.cells}  multi_row={f.multi_row}")
         except ValueError as e:
             print(f"{sid:18s} -> ОШИБКА: {e}")

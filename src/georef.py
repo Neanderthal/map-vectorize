@@ -33,6 +33,32 @@ SHEETS = {
 def _dark(rgb, thr=85):
     return (rgb[:, :, 0] < thr) & (rgb[:, :, 1] < thr) & (rgb[:, :, 2] < thr)
 
+def _colorful(rgb):
+    """Маска насыщенной заливки (тело карты), отличающая её от полей/легенды/текста."""
+    mx = np.maximum(np.maximum(rgb[:, :, 0], rgb[:, :, 1]), rgb[:, :, 2]).astype(int)
+    mn = np.minimum(np.minimum(rgb[:, :, 0], rgb[:, :, 1]), rgb[:, :, 2]).astype(int)
+    return (mx - mn > 25) & (mx > 60) & (mn < 235)
+
+def _largest_run(profile, thr):
+    """Самый «тяжёлый» непрерывный интервал индексов, где profile>thr -> (lo, hi)."""
+    idx = np.where(profile > thr)[0]
+    if len(idx) == 0:
+        return None, None
+    sp = np.where(np.diff(idx) > max(20, len(profile) // 100))[0]
+    groups = np.split(idx, sp + 1)
+    g = max(groups, key=lambda G: profile[G].sum())
+    return int(g.min()), int(g.max())
+
+def map_bbox(rgb):
+    """Bbox тела карты по цветной заливке (устойчиво к раскладке: разрезы/без)."""
+    W = rgb.shape[1]
+    col = _colorful(rgb)
+    rowc = col[:, :int(0.60 * W)].sum(axis=1)
+    mtop, mbot = _largest_run(rowc, 0.20 * rowc.max())
+    colc = col[mtop:mbot, :].sum(axis=0)
+    mleft, mright = _largest_run(colc, 0.20 * colc.max())
+    return mleft, mright, mtop, mbot
+
 def _edge_curve(dark, y0, y1, x0, x1, half=70, step=15, minvote=90):
     """Горизонтальная кромка: на окно столбцов — строка с макс. числом тёмных пикселей."""
     pts = []
@@ -60,19 +86,30 @@ def _robust_circle(xy, k=2.0, it=6):
     return (a, b, R), m.sum(), rms
 
 def detect_parallels(rgb):
-    """-> (top_circle, bot_circle), каждая (Cx,Cy,R). Полюс севернее (Cy<0)."""
+    """-> (top, bot), каждая ((Cx,Cy,R), (x_min,x_max)). Полюс севернее (Cy<0).
+
+    Полосы поиска дуг выводятся из bbox тела карты (цветная заливка), а не из
+    фиксированных долей высоты — устойчиво к раскладке листа.
+    """
     H, W = rgb.shape[:2]
     dark = _dark(rgb)
-    xL, xR = int(W * 0.09), int(W * 0.66)
-    top = _edge_curve(dark, int(H * 0.03), int(H * 0.12), xL, xR)
-    bot = _edge_curve(dark, int(H * 0.74), int(H * 0.84), max(xL - int(W*0.08), 5), xR)
-    (tc, tn, trms) = _robust_circle(top)
-    (bc, bn, brms) = _robust_circle(bot)
-    txr = (float(top[:, 0].min()), float(top[:, 0].max()))
-    bxr = (float(bot[:, 0].min()), float(bot[:, 0].max()))
-    print(f"[B] top arc  C=({tc[0]:.0f},{tc[1]:.0f}) R={tc[2]:.0f} n={tn} rms={trms:.2f}px x[{txr[0]:.0f},{txr[1]:.0f}]")
-    print(f"[B] bot arc  C=({bc[0]:.0f},{bc[1]:.0f}) R={bc[2]:.0f} n={bn} rms={brms:.2f}px x[{bxr[0]:.0f},{bxr[1]:.0f}]")
-    return (tc, txr), (bc, bxr)
+    _, mright, mtop, mbot = map_bbox(rgb)
+    if mtop is None or mright is None:
+        raise RuntimeError("[B] не найдено цветное тело карты")
+    # y-полосы — из bbox тела карты; x-поиск — широкий (поле слева пустое, ложных линий нет),
+    # чтобы поймать дугу целиком, включая клиновидный обрезанный край
+    xL, xR = int(0.03 * W), min(W - 5, mright + 60)
+    out = []
+    for name, sy in [("top", mtop), ("bot", mbot)]:
+        pts = _edge_curve(dark, max(0, sy - 140), min(H, sy + 140), xL, xR)
+        if len(pts) < 20:
+            raise RuntimeError(f"[B] не найдена {name} дуга рамки (pts={len(pts)})")
+        (c, n, rms) = _robust_circle(pts)
+        xr = (float(pts[:, 0].min()), float(pts[:, 0].max()))
+        print(f"[B] {name} arc C=({c[0]:.0f},{c[1]:.0f}) R={c[2]:.0f} n={n} "
+              f"rms={rms:.2f}px x[{xr[0]:.0f},{xr[1]:.0f}]")
+        out.append((c, xr))
+    return out[0], out[1]
 
 # ---------------------------------------------------------------- signal C ----
 def _yc(x, C):
@@ -82,27 +119,30 @@ def _yc(x, C):
 def _angle(x, y, C):
     return np.arctan2(x - C[0], y - C[1])
 
-def ocr_lon_fit(rgb, circle, side, nom_lon, band_px=280):
+def ocr_lon_fit(rgb, circle, xr, side, nom_lon, depth=135):
     """OCR подписей долготы у кромки -> линейная подгонка lon <-> угол дуги.
 
-    side='top': полоса ниже верхней кромки; side='bot': ниже нижней кромки.
-    Возвращает (coef[a,b] для lon=a*angle+b, anchors[(lon,x)], rms).
+    Полоса РЕКТИФИЦИРУЕТСЯ вдоль дуги (лента вдоль рамки выпрямляется в горизонталь) —
+    подписи градусов ложатся в один ряд, шум содержимого карты уходит. Подписи у ВЕРХНЕЙ
+    кромки лежат НИЖЕ линии, у НИЖНЕЙ — ВЫШЕ детектированной внешней рамки (в поле между
+    внутренней и внешней рамкой), поэтому лента позиционируется по стороне. xr — x-экстент
+    дуги. Возвращает (coef[a,b] lon=a*angle+b, anchors, rms).
     """
-    W = rgb.shape[1]
-    Cx, _, R = circle
-    xs = np.arange(int(max(5, Cx - R * 0.9)), int(min(W - 5, Cx + R * 0.9)))
-    yline = _yc(xs.astype(float), circle)
-    y_top = int(np.nanmin(yline))
-    y_bot = int(np.nanmax(yline))
-    if side == "top":
-        b0, b1 = y_top + 5, y_bot + band_px
-    else:
-        b0, b1 = y_top + 5, y_bot + band_px     # ниже кромки (подписи в поле)
-    x0, x1 = int(xs.min()), int(xs.max())
-    band = rgb[b0:b1, x0:x1]
-    r, g, b = (band[:, :, i].astype(int) for i in range(3))
-    bw = np.where((r < 90) & (g < 90) & (b < 90), 0, 255).astype(np.uint8)
-    up = Image.fromarray(bw).resize((bw.shape[1] * 2, bw.shape[0] * 2), Image.LANCZOS)
+    H, W = rgb.shape[:2]
+    x0, x1 = int(max(5, xr[0])), int(min(W - 5, xr[1]))
+    cols = np.arange(x0, x1)
+    yc = _yc(cols.astype(float), circle)
+    yb = yc + 5 if side == "top" else yc - (depth + 5)
+    strip = np.full((depth, len(cols), 3), 255, np.uint8)
+    for j, x in enumerate(cols):
+        y = int(yb[j])
+        if 0 <= y <= H - depth:
+            strip[:, j] = rgb[y:y + depth, x]
+    # полутон (а не жёсткая бинаризация): Tesseract сам бинаризует Otsu — заметно
+    # устойчивее на листах, где подписи не чисто-чёрные (жёсткий порог их рвёт)
+    gray = (0.299 * strip[:, :, 0] + 0.587 * strip[:, :, 1]
+            + 0.114 * strip[:, :, 2]).astype(np.uint8)
+    up = Image.fromarray(gray).resize((gray.shape[1] * 2, gray.shape[0] * 2), Image.LANCZOS)
     data = pytesseract.image_to_data(up, config=r"--psm 11",
                                      output_type=pytesseract.Output.DICT)
     anchors = []
@@ -191,16 +231,17 @@ def georef(key):
     cfg = SHEETS[key]
     nom = parse_sheet(cfg["sheet_id"])
     print(f"[A] {cfg['sheet_id']} -> lon {nom.lon_min}..{nom.lon_max}E lat {nom.lat_min}..{nom.lat_max}N "
-          f"rect={nom.is_rectangular}")
+          f"multi_row={nom.multi_row}")
     rgb = np.asarray(Image.open(cfg["raw"]).convert("RGB"))
     (top_c, top_xr), (bot_c, bot_xr) = detect_parallels(rgb)
-    top_fit, _, _ = ocr_lon_fit(rgb, top_c, "top", (nom.lon_min, nom.lon_max))
-    bot_fit, _, _ = ocr_lon_fit(rgb, bot_c, "bot", (nom.lon_min, nom.lon_max))
-    # фактический долготный экстент из C-подгонки по концам детектированных дуг (ловит клип)
+    top_fit, _, _ = ocr_lon_fit(rgb, top_c, top_xr, "top", (nom.lon_min, nom.lon_max))
+    bot_fit, _, _ = ocr_lon_fit(rgb, bot_c, bot_xr, "bot", (nom.lon_min, nom.lon_max))
+    # долготный экстент из C-подгонки по концам дуг; объединение (менее полная детекция
+    # одной из дуг не должна терять крайние меридианы) -> min запад, max восток
     def lon_at(circle, fit, x):
         return fit[0] * _angle(x, _yc(x, circle), circle) + fit[1]
-    west = max(lon_at(top_c, top_fit, top_xr[0]), lon_at(bot_c, bot_fit, bot_xr[0]))
-    east = min(lon_at(top_c, top_fit, top_xr[1]), lon_at(bot_c, bot_fit, bot_xr[1]))
+    west = min(lon_at(top_c, top_fit, top_xr[0]), lon_at(bot_c, bot_fit, bot_xr[0]))
+    east = max(lon_at(top_c, top_fit, top_xr[1]), lon_at(bot_c, bot_fit, bot_xr[1]))
     # границы листа — целые градусы: ближайший меридиан к экстенту (не теряем крайние)
     lon_lo = max(nom.lon_min, int(round(west)))
     lon_hi = min(nom.lon_max, int(round(east)))
