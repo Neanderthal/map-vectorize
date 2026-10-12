@@ -26,7 +26,8 @@ pip install -r requirements.txt
 python src/fetch_sources.py           # скачать исходники в data/raw/
 python src/georef.py <sheet>          # авто-привязка (номенклатура+сетка → EPSG:4326)
 python src/legend.py <raw.jpg>        # авто-палитра легенды (свотчи + OCR индексов)
-python src/vectorize.py <sheet> <gen> # классификация по цвету → полигоны единиц → GeoJSON
+python src/vectorize.py <sheet>       # ВСЕ единицы легенды → output/<sheet>_all.geojson
+python src/vectorize.py <sheet> f,lg  # подмножество генезисов (срез для mushrooms)
 ```
 
 ## Доступ к ру-источникам
