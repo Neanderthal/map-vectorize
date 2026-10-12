@@ -1,12 +1,20 @@
-"""Stage ④–⑤ — сегментация песчаных единиц по цвету + полигонизация в GeoJSON.
+"""Stage ④–⑤ — сегментация ВСЕХ единиц легенды по цвету + полигонизация в GeoJSON.
 
-Использует палитру легенды (`legend.extract`) и привязанный растр (`georef`, nearest —
-сохраняет точные цвета заливок). descreening (median) убирает растр CMYK; маска по
-Lab-расстоянию к цветам целевого генезиса; морфология чинит оверпринт; `features.shapes`
-даёт полигоны сразу в lon/lat; shapely упрощает/фильтрует по площади. Результат — в
-`output/<sheet>_<genera>.geojson` (EPSG:4326), атрибуты: unit, rating (★ боровика).
+Цель map-vectorize — векторизовать ВСЕ разделы легенды (не только пески). Модель класса —
+**свотч легенды**: каждый свотч = центроид цвета. Свотчи с распознанным генезисом
+группируются под общим label=генезис (несколько оттенков одного генезиса — одна единица);
+свотчи с провалом OCR генезиса (`?`) держатся РАЗДЕЛЬНО по цвету (label `?N`), иначе
+разноцветные неизвестные единицы схлопнулись бы в одну (на листе O таких ~⅓).
 
-Осознанно приближённо (см. pipeline.md): цвет ≠ генетический индекс.
+Пиксель относится к классу ближайшего по Lab центроида среди ВСЕХ свотчей (nearest-centroid,
+убирает бликование лучше порога). descreening (median) гасит растр CMYK; морфология чинит
+оверпринт; `features.shapes` даёт полигоны сразу в lon/lat; shapely упрощает/фильтрует.
+Результат — `output/<key>_<tag>.geojson` (EPSG:4326), атрибуты: unit (генезис), label
+(id класса), index (OCR-текст), rating (★ боровика — линза потребителя), color.
+
+Осознанно приближённо (см. pipeline.md): цвет ≠ генетический индекс. Единицы РАЗНОГО цвета
+разделяются; ОДНОГО цвета, разного индекса — нет (подтверждённый ресёрчем открытый фронт:
+OCR индексов на теле карты, см. docs/research-sota-full-vectorization.md).
 """
 from __future__ import annotations
 import json
@@ -17,7 +25,7 @@ import rasterio
 from rasterio.features import shapes
 from rasterio.warp import Resampling
 from skimage.color import rgb2lab
-from skimage.morphology import binary_closing, disk, remove_small_objects
+from skimage.morphology import closing, disk, remove_small_objects
 from scipy.ndimage import median_filter
 from shapely.geometry import shape, mapping
 
@@ -29,36 +37,76 @@ def _lab(rgb_u8):
     return rgb2lab(np.asarray(rgb_u8, float).reshape(1, 1, 3) / 255.0)[0, 0]
 
 
-def classify_genera(lab, palette, max_tol):
-    """Каждому пикселю — ближайший цвет среди ВСЕХ генезисов (nearest-centroid).
+def _round_coords(obj, nd=5):
+    """Округлить координаты геометрии до nd знаков (~1 м на 5) — режет вес GeoJSON.
 
-    Пиксель относится к генезису, только если тот ему БЛИЖЕ остальных — это убирает
-    бликование (порог по расстоянию ловил чужие единицы). -> (gen_of_pixel[str|''], ok_mask).
+    Хранить ~15 знаков бессмысленно: геопривязка точна до сотен метров — км (см.
+    pipeline.md), 5 знаков уже на 2 порядка точнее данных.
     """
-    cents, gens = [], []
-    for g, cols in palette.items():
-        if g == "?":
-            continue
-        for c in cols:
-            cents.append(_lab(c))
-            gens.append(g)
-    gens = np.array(gens, dtype=object)
-    best = np.full(lab.shape[:2], 1e18)
-    idx = np.full(lab.shape[:2], -1, int)
+    if isinstance(obj, (list, tuple)):
+        if obj and isinstance(obj[0], (int, float)):
+            return [round(float(c), nd) for c in obj]
+        return [_round_coords(x, nd) for x in obj]
+    return obj
+
+
+def build_classes(rows, merge_eps=3.0):
+    """rows [(y0,y1,rgb,gen,txt)] -> (labels, cents, meta, order).
+
+    Каждый свотч -> центроид (Lab). Известный генезис -> общий label=генезис (несколько
+    центроидов под одним label). `?` -> свой label `?N` на свотч. Свотчи почти одного
+    цвета (Lab < merge_eps) сливаются в уже добавленный класс — не плодим дубль-маски
+    (это и есть принятый предел «цвет ≠ индекс»).
+
+    -> labels[list[str]] и cents[list[np.ndarray]] (параллельны, по центроидам),
+       meta{label: {genesis, index, rgb}}, order[list[str]] (уникальные label по чтению).
+    """
+    labels, cents, meta, order = [], [], {}, []
+    qn = 0
+    for _y0, _y1, rgb, gen, txt in rows:
+        lab = _lab(rgb)
+        if any(((lab - c) ** 2).sum() < merge_eps ** 2 for c in cents):
+            continue                                   # почти-дубль цвета — пропустить
+        key = gen if gen != "?" else f"?{(qn := qn + 1)}"
+        labels.append(key)
+        cents.append(lab)
+        if key not in meta:
+            meta[key] = {"genesis": gen, "index": txt.strip(),
+                         "rgb": tuple(int(v) for v in rgb)}
+            order.append(key)
+    return labels, cents, meta, order
+
+
+def classify_pixels(lab_img, labels, cents, max_tol):
+    """Каждому пикселю — label ближайшего по Lab центроида (в пределах max_tol).
+
+    -> (label_px[str-array], ok_mask). ok=False у фона/текста/оверпринта (дальше max_tol).
+    """
+    best = np.full(lab_img.shape[:2], 1e18)
+    idx = np.full(lab_img.shape[:2], -1, int)
     for i, t in enumerate(cents):
-        d = ((lab - t) ** 2).sum(axis=2)
+        d = ((lab_img - t) ** 2).sum(axis=2)
         u = d < best
         best[u] = d[u]
         idx[u] = i
-    ok = best < (max_tol ** 2)                      # исключить фон/текст/оверпринт
-    gen_px = np.where(idx >= 0, gens[idx.clip(0)], "")
-    return gen_px, ok
+    ok = best < (max_tol ** 2)
+    lab_arr = np.array(labels, dtype=object)
+    label_px = np.where(idx >= 0, lab_arr[idx.clip(0)], "")
+    return label_px, ok
 
 
-def vectorize(key, genera=("f",), downscale=2, max_tol=28.0,
+def vectorize(key, units=None, downscale=2, max_tol=28.0,
               min_area_km2=0.5, simplify_m=150.0):
+    """units=None -> ВСЕ единицы легенды; units=("f","lg") -> только эти генезисы."""
     raw = SHEETS[key]["raw"]
-    palette, _ = extract(raw)
+    _palette, rows = extract(raw)
+    labels, cents, meta, order = build_classes(rows)
+    if units is None:
+        targets, tag = order, "all"
+    else:
+        targets = [lb for lb in order if meta[lb]["genesis"] in units]
+        tag = "_".join(units)
+
     tif = georef(key, downscale=downscale, resampling=Resampling.nearest, out_suffix="_seg")
     ds = rasterio.open(tif)
     rgb = ds.read().transpose(1, 2, 0)
@@ -75,31 +123,38 @@ def vectorize(key, genera=("f",), downscale=2, max_tol=28.0,
     # descreening (median) — подавить полутоновый растр CMYK
     rgbf = np.dstack([median_filter(rgb[:, :, c], size=3) for c in range(3)])
     lab = rgb2lab(rgbf.astype(np.float64) / 255.0)
-    gen_px, ok = classify_genera(lab, palette, max_tol)
+    label_px, ok = classify_pixels(lab, labels, cents, max_tol)
 
     feats = []
-    for gen in genera:
-        if gen not in palette:
-            print(f"  [{gen}] нет цветов в легенде — пропуск")
-            continue
-        m = (gen_px == gen) & ok
-        m = binary_closing(m, disk(2))
-        m = remove_small_objects(m, min_px)
+    print(f"[{key}] классов на вывод: {len(targets)} из {len(order)} "
+          f"(генезисы: {sorted({meta[lb]['genesis'] for lb in order})})")
+    for lb in targets:
+        m = (label_px == lb) & ok
+        m = closing(m, disk(2))
+        m = remove_small_objects(m, max_size=min_px - 1)   # удалить объекты < min_px px
+        g = meta[lb]
         n = 0
         for geom, _val in shapes(m.astype(np.uint8), mask=m, transform=T):
             poly = shape(geom).simplify(simplify_deg)
             if poly.is_empty or poly.area * deg2_km2 < min_area_km2:
                 continue
+            geojson_geom = mapping(poly)
+            geojson_geom["coordinates"] = _round_coords(geojson_geom["coordinates"])
             feats.append({"type": "Feature",
-                          "properties": {"unit": gen, "rating": RATING.get(gen)},
-                          "geometry": mapping(poly)})
+                          "properties": {"unit": g["genesis"], "label": lb,
+                                         "index": g["index"],
+                                         "rating": RATING.get(g["genesis"]),
+                                         "color": "%d,%d,%d" % g["rgb"]},
+                          "geometry": geojson_geom})
             n += 1
-        print(f"  [{gen}] {len(palette[gen])} цветов, маска {int(m.sum())}px -> {n} полигонов")
+        if int(m.sum()) or n:
+            print(f"  [{lb:4s} {g['genesis']:2s}] RGB={g['rgb']} "
+                  f"маска {int(m.sum())}px -> {n} полигонов")
 
     fc = {"type": "FeatureCollection",
           "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}},
           "features": feats}
-    out = f"output/{key}_{'_'.join(genera)}.geojson"
+    out = f"output/{key}_{tag}.geojson"
     with open(out, "w") as f:
         json.dump(fc, f)
     area = sum(shape(ft["geometry"]).area * deg2_km2 for ft in feats)
@@ -109,5 +164,6 @@ def vectorize(key, genera=("f",), downscale=2, max_tol=28.0,
 
 if __name__ == "__main__":
     key = sys.argv[1] if len(sys.argv) > 1 else "P-35-36"
-    genera = tuple(sys.argv[2].split(",")) if len(sys.argv) > 2 else ("f",)
-    vectorize(key, genera)
+    arg = sys.argv[2] if len(sys.argv) > 2 else "all"
+    units = None if arg in ("all", "") else tuple(arg.split(","))
+    vectorize(key, units)
