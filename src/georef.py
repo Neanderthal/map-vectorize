@@ -111,6 +111,34 @@ def detect_parallels(rgb):
         out.append((c, xr))
     return out[0], out[1]
 
+def inner_neatline(col, circle, xr, side, maxstep=220, frac=0.45, half=60, win=25):
+    """Внутренний нейтлайн (ИСТИННАЯ параллель): граница солидной геологии, ища ВНУТРЬ
+    от внешней рамки.
+
+    Советская рамка «лестничная»: жирная внешняя линия (её ловит detect_parallels как
+    argmax тёмных) отстоит от истинной параллели на минутную ленту ≈ 7 км; геология
+    примыкает к ВНУТРЕННЕЙ линии сетки. Привязка к внешней рамке даёт ~7 км ошибки на
+    С/Ю кромках (и белый шов между смежными листами). По столбцам ищем первую строку
+    плотной цветной заливки (геология) внутрь от внешней дуги, robust-окружность по ним.
+    -> circle (Cx,Cy,R) внутренней дуги (для построения GCP; долгота сигнала C — по внешней).
+    """
+    x0, x1 = int(xr[0]), int(xr[1])
+    pts = []
+    for xc in range(x0 + half, x1 - half, 15):
+        yf = int(_yc(float(xc), circle))
+        rng = range(yf, yf + maxstep) if side == "top" else range(yf, yf - maxstep, -1)
+        for y in rng:
+            if 0 <= y < col.shape[0] - win and col[y:y + win, xc - half:xc + half].mean() > frac:
+                pts.append((xc, y))
+                break
+    if len(pts) < 20:
+        raise RuntimeError(f"[B] внутренний нейтлайн {side}: мало точек ({len(pts)})")
+    (c, n, rms) = _robust_circle(np.array(pts, float))
+    xm = (x0 + x1) / 2
+    print(f"[B] {side} inner-neatline C=({c[0]:.0f},{c[1]:.0f}) R={c[2]:.0f} n={n} "
+          f"rms={rms:.2f}px shift={abs(_yc(xm, circle) - _yc(xm, c)):.0f}px")
+    return c
+
 # ---------------------------------------------------------------- signal C ----
 def _yc(x, C):
     Cx, Cy, R = C
@@ -234,6 +262,11 @@ def georef(key, downscale=4, resampling=Resampling.bilinear, out_suffix=""):
           f"multi_row={nom.multi_row}")
     rgb = np.asarray(Image.open(cfg["raw"]).convert("RGB"))
     (top_c, top_xr), (bot_c, bot_xr) = detect_parallels(rgb)
+    # внешние дуги -> сигнал C (подписи долготы в поле рамки); внутренние нейтлайны ->
+    # ИСТИННЫЕ параллели для GCP (устраняет ~7 км сдвиг у С/Ю кромок и белый шов листов)
+    col = _colorful(rgb)
+    top_in = inner_neatline(col, top_c, top_xr, "top")
+    bot_in = inner_neatline(col, bot_c, bot_xr, "bot")
     top_fit, _, _ = ocr_lon_fit(rgb, top_c, top_xr, "top", (nom.lon_min, nom.lon_max))
     bot_fit, _, _ = ocr_lon_fit(rgb, bot_c, bot_xr, "bot", (nom.lon_min, nom.lon_max))
     # долготный экстент из C-подгонки по концам дуг; объединение (менее полная детекция
@@ -248,7 +281,7 @@ def georef(key, downscale=4, resampling=Resampling.bilinear, out_suffix=""):
     lons = list(range(lon_lo, lon_hi + 1))
     print(f"[fuse] extent west={west:.2f} east={east:.2f} -> меридианы {lon_lo}..{lon_hi}E "
           f"(номенклатура {nom.lon_min}..{nom.lon_max})")
-    gcps = build_gcps(top_c, bot_c, top_fit, bot_fit, nom.lat_min, nom.lat_max, lons)
+    gcps = build_gcps(top_in, bot_in, top_fit, bot_fit, nom.lat_min, nom.lat_max, lons)
     out = warp(cfg["raw"], gcps, f"data/work/{key}_georef_4326{out_suffix}.tif",
                downscale=downscale, resampling=resampling)
     print(f"[gate] C-fit top/bot ok; nomenclature lat {nom.lat_min}-{nom.lat_max}; see lake validation")
