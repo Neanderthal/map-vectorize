@@ -27,7 +27,7 @@ GeoJSON площадных единиц легенды (EPSG:4326). Архите
   свотчей). `pytesseract` в `requirements.txt` сейчас **не объявлен** — поставить вручную
   (`pip install pytesseract`), пока не добавлен в зависимости.
 - `gdal`/`osgeo` не нужны — `rasterio` достаточно.
-- Исходные растры тянутся `python src/fetch_sources.py` (geokniga — мимо тоннеля,
+- Исходные растры тянутся `python src/fetch_sources.py` (geokniga — мимо прокси,
   см. `sources.md`). `data/raw/` и `data/work/` — **не в git**; `output/*.geojson` — **в git**.
 
 ## Конвейер по стадиям

@@ -2,7 +2,7 @@
 """Скачать исходные карты и легенды в data/raw/.
 
 Источник — geokniga.org (оцифрованные листы ГГК-1000/3). Сайт .ru доступен только
-мимо тоннеля: снимаем прокси-переменные и ходим с `--noproxy '*'` (см.
+мимо прокси: снимаем прокси-переменные и ходим с `--noproxy '*'` (см.
 .claude/rules/sources.md). ВСЕГЕИ/Карпинский закрыты UTM-шлюзом (403) — не отсюда.
 
 Файлы, которые уже есть, повторно не качаются. Запуск: `python src/fetch_sources.py`.
@@ -45,7 +45,7 @@ SOURCES: dict[str, tuple[str, str]] = {
     "ggk1000_O-35-36_legend2.pdf": (f"{GEOKNIGA}/maps/additional/o-35-36n-35kqo2.pdf", f"{GEOKNIGA}/maps/7869"),
 }
 
-# снять прокси-окружение (тоннель/Tor), чтобы ходить напрямую
+# снять прокси-окружение, чтобы ходить напрямую
 PROXY_VARS = ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
 UA = "Mozilla/5.0 (X11; Linux x86_64) Firefox/128.0"
 

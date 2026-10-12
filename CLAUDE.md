@@ -32,7 +32,7 @@ python src/vectorize.py <sheet> f,lg  # подмножество генезис�
 
 ## Доступ к ру-источникам
 
-geokniga.org доступна только мимо тоннеля (proxy-off + `--noproxy '*'`); ВСЕГЕИ закрыт
+geokniga.org доступна только мимо прокси (proxy-off + `--noproxy '*'`); ВСЕГЕИ закрыт
 (403 за UTM-шлюзом). Детали — в `.claude/rules/sources.md`.
 
 ## Правила
